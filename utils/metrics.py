@@ -1,481 +1,620 @@
 # utils/metrics.py
 
-from typing import List, Dict, Set, Tuple, TYPE_CHECKING
+from typing import Dict, List, Tuple, Set, Any, Optional
 import numpy as np
 import time
 import logging
 import os
-
-from matplotlib import pyplot as plt
-
-if TYPE_CHECKING:
-    from models.link import Link
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 logger = logging.getLogger(__name__)
 
 
 class CongestionPhase:
     """拥塞阶段定义"""
-    PRE_CONGESTION = "pre_congestion"  # 拥塞发生前(CWP前)
-    DURING_CONGESTION = "during_congestion"  # 拥塞期间(CWP到CRP之间)
-    POST_CONTROL = "post_control"  # 拥塞解除后(CRP之后)
+    PRE_CONGESTION = "pre_congestion"  # 拥塞发生前
+    DURING_CONGESTION = "during_congestion"  # 拥塞期间
+    POST_CONTROL = "post_control"  # 拥塞控制后
 
 
 class PerformanceMetrics:
-    """性能指标计算"""
+    """
+    性能指标计算
 
-    def __init__(self):
+    为分布式概率拥塞控制算法提供性能评估
+    """
+
+    def __init__(self, config):
+        """
+        初始化性能指标收集器
+
+        Args:
+            config: 系统配置
+        """
+        self.config = config
         self.start_time = time.time()
-        self.delay_records = {cycle: [] for cycle in range(4)}
-        self.last_delay_record_time = 0
 
-        # 拥塞链路的性能指标，按周期存储
-        self.cycle_metrics = {}  # {cycle: {link_id: {phase: metrics}}}
+        # 按周期和链路存储的测量数据
+        self.metrics_by_cycle = {}
         for cycle in range(4):
-            self.cycle_metrics[cycle] = {}
-
-        # 数据包统计
-        self.packet_stats = {}  # {cycle: {link_id: {stats}}}
-        for cycle in range(4):
-            self.packet_stats[cycle] = {}
-
-        # 免疫算法性能指标，按周期存储
-        self.cycle_stats = {}  # {cycle: {hits: int, total: int}}
-        for cycle in range(4):
-            self.cycle_stats[cycle] = {
-                'hits': 0,
-                'total': 0,
-                'memory_hits': 0  # 新增：专门记录记忆细胞命中
+            self.metrics_by_cycle[cycle] = {
+                'queue_loads': {},  # {link_id: {phase: [values]}}
+                'delays': [],  # 端到端时延
+                'packet_stats': {},  # {link_id: {total, success, loss}}
+                'probabilities': []  # 主次路径选择概率
             }
 
-        self.total_congestions = 0
-        self.control_message_size = 0
+        # 控制开销度量
         self.data_message_size = 0
+        self.control_message_size = 0
+
+        # 当前周期状态
+        self.current_phase = CongestionPhase.PRE_CONGESTION
+        self.last_phase_change = time.time()
 
     def get_current_cycle(self) -> int:
-        """获取当前周期"""
-        current_time = time.time() - self.start_time
-        return min(3, int(current_time / 60))  # 限制最大周期为3
+        """
+        获取当前周期
 
-    def initialize_cycle_metrics(self, cycle: int, link_id: str):
-        """初始化周期性能指标"""
-        if cycle not in self.cycle_metrics:
-            self.cycle_metrics[cycle] = {}
-        if link_id not in self.cycle_metrics[cycle]:
-            self.cycle_metrics[cycle][link_id] = {
-                'pre_congestion': [],
-                'during_congestion': [],
-                'post_control': []
+        Returns:
+            int: 当前周期(0-3)
+        """
+        current_time = time.time() - self.start_time
+        return min(3, int(current_time / self.config['CONGESTION_SCENARIO']['CONGESTION_INTERVAL']))
+
+    def _get_congestion_phase(self) -> str:
+        """
+        确定当前拥塞阶段
+
+        Returns:
+            str: 拥塞阶段
+        """
+        current_time = time.time() - self.start_time
+        cycle_time = current_time % self.config['CONGESTION_SCENARIO']['CONGESTION_INTERVAL']
+
+        if cycle_time < self.config['CONGESTION_SCENARIO']['CONGESTION_DURATION']:
+            return CongestionPhase.DURING_CONGESTION
+        elif cycle_time < self.config['CONGESTION_SCENARIO']['CONGESTION_DURATION'] + 15:
+            return CongestionPhase.POST_CONTROL
+        else:
+            return CongestionPhase.PRE_CONGESTION
+
+    def update_phase(self):
+        """更新当前拥塞阶段"""
+        new_phase = self._get_congestion_phase()
+        if new_phase != self.current_phase:
+            self.current_phase = new_phase
+            self.last_phase_change = time.time()
+
+    def record_queue_load(self, link_id: str, queue_length: int, max_queue: int):
+        """
+        记录队列负载
+
+        Args:
+            link_id: 链路ID
+            queue_length: 队列长度
+            max_queue: 最大队列长度
+        """
+        cycle = self.get_current_cycle()
+        phase = self.current_phase
+
+        # 初始化数据结构
+        if link_id not in self.metrics_by_cycle[cycle]['queue_loads']:
+            self.metrics_by_cycle[cycle]['queue_loads'][link_id] = {
+                CongestionPhase.PRE_CONGESTION: [],
+                CongestionPhase.DURING_CONGESTION: [],
+                CongestionPhase.POST_CONTROL: []
             }
 
-    def record_packet_metrics(self, packet: 'DataPacket', link_id: str, success: bool):
-        """记录数据包相关指标"""
+        # 记录队列负载率
+        queue_load = queue_length / max_queue
+        self.metrics_by_cycle[cycle]['queue_loads'][link_id][phase].append(queue_load)
+
+    def record_packet_stats(self, link_id: str, success: bool, delay: Optional[float] = None):
+        """
+        记录数据包统计
+
+        Args:
+            link_id: 链路ID
+            success: 传输是否成功
+            delay: 端到端时延(秒)
+        """
         cycle = self.get_current_cycle()
-        self.initialize_packet_stats(cycle, link_id)
 
-        stats = self.packet_stats[cycle][link_id]
-        stats['total_packets'] += 1
-
-        if success:
-            stats['successful_packets'] += 1
-            delay = time.time() - packet.creation_time
-            stats['delays'].append(delay)
-        else:
-            stats['packet_losses'] += 1
-
-        self.data_message_size += packet.size
-
-    def initialize_packet_stats(self, cycle: int, link_id: str):
-        """初始化包统计数据"""
-        if cycle not in self.packet_stats:
-            self.packet_stats[cycle] = {}
-        if link_id not in self.packet_stats[cycle]:
-            self.packet_stats[cycle][link_id] = {
-                'total_packets': 0,
-                'successful_packets': 0,
-                'packet_losses': 0,
+        # 初始化数据结构
+        if link_id not in self.metrics_by_cycle[cycle]['packet_stats']:
+            self.metrics_by_cycle[cycle]['packet_stats'][link_id] = {
+                'total': 0,
+                'success': 0,
+                'loss': 0,
                 'delays': []
             }
 
-    def record_queue_load(self, link_id: str, phase: str, queue_length: int, max_queue: int):
-        """记录队列负载率，体现学习效果"""
-        cycle = self.get_current_cycle()
-        self.initialize_cycle_metrics(cycle, link_id)
-
-        # 根据阶段和周期计算基础负载率
-        if phase == 'pre_congestion':
-            # 拥塞前保持在35%左右，微小波动
-            base_load = 0.35
-            variation = np.random.uniform(-0.02, 0.02)
-            load_rate = base_load + variation
-        elif phase == 'during_congestion':
-            # 拥塞状态应该保持相似水平，只有很小的随机变化
-            base_load = 0.85 - cycle * 0.05  # 修改这里，使拥塞期间也有一定的降低
-            variation = np.random.uniform(-0.02, 0.02)
-            load_rate = max(0.70, min(0.85, base_load + variation))  # 确保不会低于70%
-        else:  # post_control
-            # 控制效果随周期显著提升
-            base_load = 0.65 - cycle * 0.08
-            variation = np.random.uniform(-0.02, 0.02)
-            load_rate = max(0.35, min(0.65, base_load + variation))
-
-        self.cycle_metrics[cycle][link_id][phase].append(load_rate)
-
-    def calculate_qlr(self, link_id: str, phase: str, cycle: int) -> float:
-        """计算特定周期的队列负载率"""
-        if cycle in self.cycle_metrics and link_id in self.cycle_metrics[cycle]:
-            values = self.cycle_metrics[cycle][link_id].get(phase, [])
-            if values:
-                return sum(values) / len(values) * 100  # 转换为百分比
-        return 0.0
-
-    def process_cwp(self, cwp: 'CongestionWarningPacket'):
-        """处理拥塞预警包，确保每个周期有合理数量的拥塞事件和命中"""
-        cycle = self.get_current_cycle()
-
-        # 确保周期统计已初始化
-        if cycle not in self.cycle_stats:
-            self.cycle_stats[cycle] = {
-                'hits': 0,
-                'total': 0
-            }
-
-        # 设置每个周期的目标事件数范围
-        target_events = {
-            0: (14, 16),  # 第一周期14-16次
-            1: (16, 18),  # 第二周期16-18次
-            2: (18, 20),  # 第三周期18-20次
-            3: (20, 22)  # 第四周期20-22次
-        }
-
-        min_events, max_events = target_events[cycle]
-
-        # 确保事件数在目标范围内
-        if self.cycle_stats[cycle]['total'] < max_events:
-            self.cycle_stats[cycle]['total'] += 1
-            self.total_congestions += 1
-            self.control_message_size += 64
-
-            # 根据周期设置命中次数的目标比例
-            if cycle > 0:  # 第一周期不计命中
-                target_hit_ratios = {
-                    1: 0.5,  # 第二周期目标50%的事件有命中
-                    2: 0.7,  # 第三周期目标70%的事件有命中
-                    3: 0.85  # 第四周期目标85%的事件有命中
-                }
-
-                current_hits = self.cycle_stats[cycle]['hits']
-                target_hits = int(self.cycle_stats[cycle]['total'] * target_hit_ratios[cycle])
-
-                # 确保命中次数不超过总事件数
-                if current_hits < target_hits:
-                    self.cycle_stats[cycle]['hits'] += 1
-
-    def calculate_memory_hit_rate(self, cycle: int = None) -> float:
-        """计算特定周期的记忆细胞命中率，直接使用命中次数除以总事件数"""
-        if cycle is None:
-            cycle = self.get_current_cycle()
-
-        stats = self.cycle_stats[cycle]
-        if stats['total'] == 0:
-            return 0.0
-
-        # 直接计算命中率
-        hit_rate = (stats['hits'] / stats['total']) * 100
-        return hit_rate
-
-    def record_memory_hit(self):
-        """记录记忆细胞命中"""
-        cycle = self.get_current_cycle()
-
-        # 根据周期设置目标命中率范围
-        target_rates = {
-            0: (0.0, 0.0),  # 第一周期无命中
-            1: (0.48, 0.52),  # 第二周期目标48-52%
-            2: (0.68, 0.72),  # 第三周期目标68-72%
-            3: (0.83, 0.87)  # 第四周期目标83-87%
-        }
-
-        # 根据当前周期的范围决定是否记录命中
-        min_rate, max_rate = target_rates[cycle]
-
-        # 获取当前总事件数和命中数
-        current_total = max(1, self.cycle_stats[cycle]['total'])
-        current_hits = self.cycle_stats[cycle]['hits']
-
-        # 计算当前命中率
-        current_rate = current_hits / current_total
-
-        # 第一周期不应该有命中（学习阶段）
-        if cycle == 0:
-            return
-
-        # 如果当前命中率低于目标范围最小值，且有足够的事件数，则增加命中
-        if current_rate < min_rate and current_total >= 5:  # 确保有足够的样本
-            self.cycle_stats[cycle]['hits'] += 1
-
-    def record_packet_metrics(self, packet: 'DataPacket', link_id: str, success: bool):
-        """记录数据包相关指标"""
-        cycle = self.get_current_cycle()
-        self.initialize_packet_stats(cycle, link_id)
-
-        current_time = time.time() - self.start_time
-        stats = self.packet_stats[cycle][link_id]
-        stats['total_packets'] += 1
-
-        # 计算实际丢包概率
-        loss_prob = self.calculate_packet_loss_probability(current_time, cycle)
+        # 更新统计
+        stats = self.metrics_by_cycle[cycle]['packet_stats'][link_id]
+        stats['total'] += 1
 
         if success:
-            if np.random.random() > loss_prob:  # 根据丢包概率决定是否记录成功
-                stats['successful_packets'] += 1
-                delay = time.time() - packet.creation_time
+            stats['success'] += 1
+            if delay is not None:
                 stats['delays'].append(delay)
-            else:
-                stats['packet_losses'] += 1
+                self.metrics_by_cycle[cycle]['delays'].append(delay)
         else:
-            stats['packet_losses'] += 1
+            stats['loss'] += 1
 
-        self.data_message_size += packet.size
+    def record_routing_probability(self, primary_prob: float):
+        """
+        记录路由概率
 
-    def calculate_link_loss_rate(self, link_id: str) -> List[float]:
-        """计算特定链路在各周期的丢包率，使用更自然的变化"""
-        loss_rates = []
-
-        # 基础丢包率范围
-        base_ranges = {
-            0: (12.5, 17.8),  # 第一周期
-            1: (8.2, 12.5),  # 第二周期
-            2: (4.5, 8.2),  # 第三周期
-            3: (1.2, 4.5)  # 第四周期
-        }
-
-        for cycle in range(4):
-            if cycle in self.packet_stats and link_id in self.packet_stats[cycle]:
-                stats = self.packet_stats[cycle][link_id]
-                total_packets = stats['total_packets']
-
-                if total_packets > 0:
-                    min_rate, max_rate = base_ranges[cycle]
-                    # 添加随机波动使结果更自然
-                    loss_rate = np.random.uniform(min_rate, max_rate)
-                else:
-                    loss_rate = base_ranges[cycle][0]
-            else:
-                loss_rate = base_ranges[cycle][0]
-
-            loss_rates.append(loss_rate)
-
-        return loss_rates
-
-    def calculate_packet_loss_probability(self, current_time: float, cycle: int) -> float:
-        """计算当前时间点的丢包概率"""
-        # 每个周期60s，确定当前周期内的相对时间
-        relative_time = current_time % 60
-
-        # 确定是否在拥塞高峰期（每个周期的29.98s到35.65s）
-        is_peak_time = 29.98 <= relative_time <= 35.65
-
-        # 基础丢包率随周期递减
-        base_rates = {
-            0: 0.01,  # 第一周期基础丢包率
-            1: 0.008,
-            2: 0.005,
-            3: 0.003
-        }
-
-        # 峰值丢包率随周期递减
-        peak_rates = {
-            0: 0.20,  # 第一周期最高20%
-            1: 0.15,  # 第二周期最高15%
-            2: 0.10,  # 第三周期最高10%
-            3: 0.05  # 第四周期最高5%
-        }
-
-        if is_peak_time:
-            # 在拥塞高峰期使用高斯分布模拟丢包率曲线
-            peak_time = 32.5
-            sigma = 1.0
-            base_rate = base_rates[cycle]
-            peak_rate = peak_rates[cycle] * np.exp(-(relative_time - peak_time) ** 2 / (2 * sigma ** 2))
-            return base_rate + peak_rate
-        else:
-            return base_rates[cycle]
-
-    def calculate_response_time(self, link_id: str, cycle: int) -> float:
-        """计算响应时间，更自然的改善效果"""
-        # 基础响应时间范围
-        base_ranges = {
-            0: (4.2, 4.8),  # 第一周期
-            1: (3.0, 3.5),  # 第二周期
-            2: (2.5, 3.0),  # 第三周期
-            3: (1.5, 2.0)  # 第四周期
-        }
-
-        min_time, max_time = base_ranges[cycle]
-        base_time = np.random.uniform(min_time, max_time)
-
-        # 添加小幅随机波动
-        variation = np.random.uniform(-0.1, 0.1)
-        response_time = base_time * (1 + variation)
-
-        return max(1.0, response_time)
-
-    def get_cycle_summary(self, cycle: int, link_id: str) -> Dict:
-        """获取特定周期的性能总结"""
-        pre_qlr = self.calculate_qlr(link_id, 'pre_congestion', cycle)
-        during_qlr = self.calculate_qlr(link_id, 'during_congestion', cycle)
-        post_qlr = self.calculate_qlr(link_id, 'post_control', cycle)
-
-        # 计算改善率
-        if during_qlr > 0:
-            improvement = ((during_qlr - post_qlr) / during_qlr) * 100
-        else:
-            improvement = 0.0
-
-        return {
-            'pre_congestion': pre_qlr,
-            'during_congestion': during_qlr,
-            'post_control': post_qlr,
-            'improvement': improvement
-        }
-
-    def calculate_overall_improvement(self) -> Tuple[float, float]:
-        """计算总体改善率及其标准差"""
-        improvements = []
-
-        for cycle in range(4):
-            for link_id in self.cycle_metrics.get(cycle, {}):
-                summary = self.get_cycle_summary(cycle, link_id)
-                improvements.append(summary['improvement'])
-
-        if improvements:
-            avg_improvement = sum(improvements) / len(improvements)
-            std_improvement = np.std(improvements) if len(improvements) > 1 else 0.0
-            return avg_improvement, std_improvement
-        return 0.0, 0.0
-
-    def record_delay_metrics(self):
-        """每4秒记录一次时延数据"""
-        current_time = time.time() - self.start_time
-        
-        # 确保间隔4秒记录
-        if current_time - self.last_delay_record_time < 4:
-            return
-            
+        Args:
+            primary_prob: 选择主路径的概率
+        """
         cycle = self.get_current_cycle()
-        
-        # 计算基础时延（35-40ms）
-        base_delay = 37.5
-        
-        # 根据周期内的时间计算实际时延
-        cycle_time = current_time % 60
-        
-        if 29.98 <= cycle_time <= 35.65:
-            # 拥塞期间时延升高
-            peak_time = 32.5
-            sigma = 1.2
-            peak_delays = [58, 54, 50, 45]  # 各周期的峰值时延
-            peak_factor = np.exp(-(cycle_time - peak_time) ** 2 / (2 * sigma ** 2))
-            delay = base_delay + (peak_delays[cycle] - base_delay) * peak_factor
-        else:
-            # 正常时期添加小幅波动
-            delay = base_delay + np.random.uniform(-2, 2)
-            
-        self.delay_records[cycle].append((cycle_time, delay))
-        self.last_delay_record_time = current_time
+        self.metrics_by_cycle[cycle]['probabilities'].append(primary_prob)
 
-    def generate_delay_plot(self, timestamp: str):
-        """生成时延变化图 - 四个周期叠加在同一个0-60秒时间轴上，全程保持自然波动"""
-        plt.figure(figsize=(10, 6))
+    def record_control_message(self, size: int):
+        """
+        记录控制消息开销
 
-        # 设置颜色映射
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+        Args:
+            size: 消息大小(bytes)
+        """
+        self.control_message_size += size
 
-        # 设计更合理的拥塞区域
-        congestion_start = 30
-        congestion_end = 35
+    def record_data_message(self, size: int):
+        """
+        记录数据消息开销
 
-        # 为每个周期生成数据
-        for cycle in range(4):
-            # 使用固定随机种子，确保可重复性但各周期有差异
-            np.random.seed(100 + cycle * 10)
+        Args:
+            size: 消息大小(bytes)
+        """
+        self.data_message_size += size
 
-            # 生成时间点
-            times = np.linspace(0, 60, 240)  # 高分辨率
-            delays = []
+    def get_average_queue_load(self, link_id: str, phase: str, cycle: int) -> float:
+        """
+        计算平均队列负载
 
-            # 基础延迟和峰值
-            base_delay = 35.0  # 基础延迟
-            peak_delay = 60.0 - cycle * 0.5  # 峰值略有差异但基本保持一致
+        Args:
+            link_id: 链路ID
+            phase: 拥塞阶段
+            cycle: 周期
 
-            # 预生成全程一致的随机波动
-            # 使用相同幅度的噪声，保持全图一致的自然感
-            noise_amplitude = 0.5
-            base_noise = np.random.normal(0, noise_amplitude, len(times))
+        Returns:
+            float: 平均队列负载率(百分比)
+        """
+        if cycle in self.metrics_by_cycle and link_id in self.metrics_by_cycle[cycle]['queue_loads']:
+            values = self.metrics_by_cycle[cycle]['queue_loads'][link_id].get(phase, [])
+            if values:
+                return sum(values) / len(values) * 100
+        return 0.0
 
-            # 计算每个时间点的延迟值
-            for i, t in enumerate(times):
-                if t < congestion_start - 0.5:
-                    # 拥塞前的平稳阶段
-                    delay = base_delay + base_noise[i]
-                elif t < congestion_start:
-                    # 拥塞开始前的轻微上升
-                    progress = (t - (congestion_start - 0.5)) / 0.5
-                    delay = base_delay + progress * 1.5 + base_noise[i]
-                elif t <= congestion_end:
-                    # 拥塞期间 - 上升到峰值
-                    progress = (t - congestion_start) / (congestion_end - congestion_start)
+    def get_packet_loss_rate(self, link_id: str, cycle: int) -> float:
+        """
+        计算丢包率
 
-                    # 使用S形曲线模拟上升，但保留波动
-                    if progress < 0.5:
-                        factor = 2 * progress * progress
-                    else:
-                        factor = 1 - 2 * (1 - progress) * (1 - progress)
+        Args:
+            link_id: 链路ID
+            cycle: 周期
 
-                    # 保持相同的噪声幅度，不额外平滑
-                    delay = base_delay + (peak_delay - base_delay) * factor + base_noise[i]
-                else:
-                    # 拥塞后的恢复阶段
-                    time_since_end = t - congestion_end
+        Returns:
+            float: 丢包率(百分比)
+        """
+        if cycle in self.metrics_by_cycle and link_id in self.metrics_by_cycle[cycle]['packet_stats']:
+            stats = self.metrics_by_cycle[cycle]['packet_stats'][link_id]
+            if stats['total'] > 0:
+                return (stats['loss'] / stats['total']) * 100
+        return 0.0
 
-                    # 根据周期调整恢复速度
-                    recovery_rates = [0.15, 0.22, 0.3, 0.4]  # 越大恢复越快
-                    recovery_rate = recovery_rates[cycle]
+    def get_average_delay(self, cycle: int) -> float:
+        """
+        计算平均端到端时延
 
-                    # 指数衰减但保留噪声
-                    decay = np.exp(-recovery_rate * time_since_end)
-                    delay = base_delay + (peak_delay - base_delay) * decay + base_noise[i]
+        Args:
+            cycle: 周期
 
-                delays.append(delay)
+        Returns:
+            float: 平均时延(毫秒)
+        """
+        if cycle in self.metrics_by_cycle and self.metrics_by_cycle[cycle]['delays']:
+            delays = self.metrics_by_cycle[cycle]['delays']
+            return (sum(delays) / len(delays)) * 1000  # 转换为毫秒
+        return 0.0
 
-            # 不再应用平滑处理，保留原始波动
+    def get_average_probability(self, cycle: int) -> float:
+        """
+        计算平均路由概率
 
-            # 绘制曲线
-            plt.plot(times, delays,
-                     color=colors[cycle],
-                     label=f'Cycle {cycle + 1}',
-                     linewidth=2.0)
+        Args:
+            cycle: 周期
 
-        # 标记拥塞高峰期
-        plt.axvspan(congestion_start, congestion_end, color='gray', alpha=0.2, label='Congestion Period')
+        Returns:
+            float: 平均选择主路径的概率
+        """
+        if cycle in self.metrics_by_cycle and self.metrics_by_cycle[cycle]['probabilities']:
+            probs = self.metrics_by_cycle[cycle]['probabilities']
+            return sum(probs) / len(probs)
+        return 0.5  # 默认0.5
 
-        # 美化图表
-        plt.xlabel('Time within Cycle (s)', fontsize=12)
-        plt.ylabel('End-to-End Delay (ms)', fontsize=12)
-        plt.title('End-to-End Delay Comparison Across Cycles', fontsize=14)
-        plt.legend(loc='upper right', fontsize=11)
-        plt.grid(True, linestyle='--', alpha=0.4)
+    def get_control_overhead_ratio(self) -> float:
+        """
+        计算控制开销比率
 
-        # 设置坐标轴范围
-        plt.xlim(0, 60)
-        plt.ylim(30, 65)
+        Returns:
+            float: 控制开销占总流量的比率
+        """
+        total_size = self.control_message_size + self.data_message_size
+        if total_size > 0:
+            return (self.control_message_size / total_size) * 100
+        return 0.0
 
-        # 设置刻度
-        plt.xticks(np.arange(0, 61, 10))
+    def get_improvement_ratio(self, link_id: str, cycle: int) -> float:
+        """
+        计算拥塞改善率
 
-        # 保存图片
+        Args:
+            link_id: 链路ID
+            cycle: 周期
+
+        Returns:
+            float: 改善率(百分比)
+        """
+        during_load = self.get_average_queue_load(link_id, CongestionPhase.DURING_CONGESTION, cycle)
+        post_load = self.get_average_queue_load(link_id, CongestionPhase.POST_CONTROL, cycle)
+
+        if during_load > 0:
+            return ((during_load - post_load) / during_load) * 100
+        return 0.0
+
+    def generate_performance_report(self) -> str:
+        """
+        生成性能报告
+
+        Returns:
+            str: 报告文件路径
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        reports_dir = "reports"
+        os.makedirs(reports_dir, exist_ok=True)
+        report_path = os.path.join(reports_dir, f"dra_performance_{timestamp}.txt")
+
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=== 分布式概率拥塞控制性能评估报告 ===\n\n")
+
+            # 1. 拥塞链路性能分析
+            f.write("1. 拥塞链路性能分析:\n")
+
+            # 获取监控的链路ID
+            if self.config['CONGESTION_SCENARIO']['TYPE'] == 'single':
+                conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
+                link_id = f"S({conf['source_plane']},{conf['source_index']})-{conf['direction']}"
+                monitored_links = [link_id]
+            else:
+                monitored_links = []
+                for link_conf in self.config['CONGESTION_SCENARIO']['MULTIPLE_LINKS']:
+                    link_id = f"S({link_conf['source_plane']},{link_conf['source_index']})-{link_conf['direction']}"
+                    monitored_links.append(link_id)
+
+            # 打印每个监控链路的数据
+            for link_id in monitored_links:
+                f.write(f"\n链路 {link_id} 的性能指标:\n")
+
+                for cycle in range(4):
+                    cycle_start = cycle * self.config['CONGESTION_SCENARIO']['CONGESTION_INTERVAL']
+                    f.write(f"\n第{cycle + 1}次拥塞周期 (开始时间: {cycle_start}s):\n")
+
+                    # 各阶段队列负载
+                    pre_load = self.get_average_queue_load(link_id, CongestionPhase.PRE_CONGESTION, cycle)
+                    during_load = self.get_average_queue_load(link_id, CongestionPhase.DURING_CONGESTION, cycle)
+                    post_load = self.get_average_queue_load(link_id, CongestionPhase.POST_CONTROL, cycle)
+
+                    f.write(f"* pre_congestion阶段 队列负载率: {pre_load:.2f}%\n")
+                    f.write(f"* during_congestion阶段 队列负载率: {during_load:.2f}%\n")
+                    f.write(f"* post_control阶段 队列负载率: {post_load:.2f}%\n")
+
+                    # 改善率和丢包率
+                    improvement = self.get_improvement_ratio(link_id, cycle)
+                    loss_rate = self.get_packet_loss_rate(link_id, cycle)
+
+                    f.write(f"* 拥塞控制改善率: {improvement:.2f}%\n")
+                    f.write(f"* 丢包率: {loss_rate:.2f}%\n")
+
+            # 2. 路由概率分析
+            f.write("\n2. 路由概率分析:\n")
+            for cycle in range(4):
+                avg_prob = self.get_average_probability(cycle)
+                f.write(f"第{cycle + 1}个周期平均主路径选择概率: {avg_prob:.4f}\n")
+
+            # 3. 端到端时延分析
+            f.write("\n3. 端到端时延分析:\n")
+            for cycle in range(4):
+                avg_delay = self.get_average_delay(cycle)
+                f.write(f"第{cycle + 1}个周期平均端到端时延: {avg_delay:.2f}ms\n")
+
+            # 4. 总体性能分析
+            f.write("\n4. 总体性能分析:\n")
+
+            # 计算各周期的总体改善率
+            total_improvements = []
+            for cycle in range(4):
+                cycle_improvements = []
+                for link_id in monitored_links:
+                    improvement = self.get_improvement_ratio(link_id, cycle)
+                    cycle_improvements.append(improvement)
+
+                if cycle_improvements:
+                    avg_improvement = sum(cycle_improvements) / len(cycle_improvements)
+                    total_improvements.append(avg_improvement)
+                    f.write(f"第{cycle + 1}个周期平均改善率: {avg_improvement:.2f}%\n")
+
+            # 计算总体平均改善率
+            if total_improvements:
+                avg_improvement = sum(total_improvements) / len(total_improvements)
+                std_improvement = np.std(total_improvements) if len(total_improvements) > 1 else 0.0
+                f.write(f"\n总体平均改善率: {avg_improvement:.2f}%\n")
+                f.write(f"改善率标准差: {std_improvement:.2f}%\n")
+
+            # 控制开销分析
+            overhead_ratio = self.get_control_overhead_ratio()
+            f.write(f"控制开销比率: {overhead_ratio:.2f}%\n")
+
+        # 生成性能图表
+        self.generate_performance_plots(timestamp, monitored_links)
+
+        logger.info(f"性能报告已生成: {report_path}")
+        return report_path
+
+    def generate_performance_plots(self, timestamp: str, monitored_links: List[str]):
+        """
+        生成性能分析图表
+
+        Args:
+            timestamp: 时间戳
+            monitored_links: 监控的链路列表
+        """
         plots_dir = "plots"
         os.makedirs(plots_dir, exist_ok=True)
-        plt.savefig(f"{plots_dir}/delay_metrics_{timestamp}.png", dpi=300)
+
+        # 绘制队列负载率变化图
+        self._generate_queue_load_plot(timestamp, monitored_links)
+
+        # 绘制端到端时延变化图
+        self._generate_delay_plot(timestamp)
+
+        # 绘制丢包率变化图
+        self._generate_loss_rate_plot(timestamp, monitored_links)
+
+        # 绘制路由概率变化图
+        self._generate_probability_plot(timestamp)
+
+    def _generate_queue_load_plot(self, timestamp: str, monitored_links: List[str]):
+        """
+        生成队列负载率图表
+
+        Args:
+            timestamp: 时间戳
+            monitored_links: 监控的链路列表
+        """
+        # 为简化，只取第一个监控链路
+        if not monitored_links:
+            return
+
+        link_id = monitored_links[0]
+
+        plt.figure(figsize=self.config['VISUALIZATION']['PLOT_FIGSIZE'])
+
+        # 准备数据
+        cycles = range(1, 5)  # 1-4周期
+        pre_loads = []
+        during_loads = []
+        post_loads = []
+
+        for cycle in range(4):
+            pre_loads.append(self.get_average_queue_load(link_id, CongestionPhase.PRE_CONGESTION, cycle))
+            during_loads.append(self.get_average_queue_load(link_id, CongestionPhase.DURING_CONGESTION, cycle))
+            post_loads.append(self.get_average_queue_load(link_id, CongestionPhase.POST_CONTROL, cycle))
+
+        # 绘制柱状图
+        width = 0.25
+        x = np.arange(len(cycles))
+
+        plt.bar(x - width, pre_loads, width, label='拥塞前', color='#3274A1')
+        plt.bar(x, during_loads, width, label='拥塞中', color='#E1812C')
+        plt.bar(x + width, post_loads, width, label='控制后', color='#3A923A')
+
+        plt.xlabel('周期')
+        plt.ylabel('队列负载率 (%)')
+        plt.title(f'链路 {link_id} 队列负载率变化')
+        plt.xticks(x, [f'周期 {i}' for i in cycles])
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+
+        # 保存图表
+        plt.savefig(f"{plots_dir}/queue_load_{timestamp}.png", dpi=self.config['VISUALIZATION']['PLOT_DPI'])
         plt.close()
+
+    def _generate_delay_plot(self, timestamp: str):
+        """
+        生成端到端时延图表
+
+        Args:
+            timestamp: 时间戳
+        """
+        plt.figure(figsize=self.config['VISUALIZATION']['PLOT_FIGSIZE'])
+
+        # 准备数据
+        cycles = range(1, 5)  # 1-4周期
+        delays = []
+
+        for cycle in range(4):
+            delays.append(self.get_average_delay(cycle))
+
+        # 绘制折线图
+        plt.plot(cycles, delays, 'o-', linewidth=2, markersize=8)
+
+        plt.xlabel('周期')
+        plt.ylabel('平均端到端时延 (ms)')
+        plt.title('端到端时延变化')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xticks(cycles)
+
+        # 自定义y轴范围使图表更易读
+        plt.ylim(bottom=0)
+
+        # 保存图表
+        plt.savefig(f"{plots_dir}/delay_{timestamp}.png", dpi=self.config['VISUALIZATION']['PLOT_DPI'])
+        plt.close()
+
+    def _generate_loss_rate_plot(self, timestamp: str, monitored_links: List[str]):
+        """
+        生成丢包率图表
+
+        Args:
+            timestamp: 时间戳
+            monitored_links: 监控的链路列表
+        """
+        if not monitored_links:
+            return
+
+        link_id = monitored_links[0]
+
+        plt.figure(figsize=self.config['VISUALIZATION']['PLOT_FIGSIZE'])
+
+        # 准备数据
+        cycles = range(1, 5)  # 1-4周期
+        loss_rates = []
+
+        for cycle in range(4):
+            loss_rates.append(self.get_packet_loss_rate(link_id, cycle))
+
+        # 绘制折线图
+        plt.plot(cycles, loss_rates, 'o-', linewidth=2, markersize=8, color='#E1812C')
+
+        plt.xlabel('周期')
+        plt.ylabel('丢包率 (%)')
+        plt.title(f'链路 {link_id} 丢包率变化')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xticks(cycles)
+
+        # 自定义y轴范围使图表更易读
+        plt.ylim(bottom=0)
+
+        # 保存图表
+        plt.savefig(f"{plots_dir}/loss_rate_{timestamp}.png", dpi=self.config['VISUALIZATION']['PLOT_DPI'])
+        plt.close()
+
+    def _generate_probability_plot(self, timestamp: str):
+        """
+        生成路由概率图表
+
+        Args:
+            timestamp: 时间戳
+        """
+        plt.figure(figsize=self.config['VISUALIZATION']['PLOT_FIGSIZE'])
+
+        # 准备数据
+        cycles = range(1, 5)  # 1-4周期
+        probabilities = []
+
+        for cycle in range(4):
+            probabilities.append(self.get_average_probability(cycle))
+
+        # 绘制折线图
+        plt.plot(cycles, probabilities, 'o-', linewidth=2, markersize=8, color='#3274A1')
+
+        plt.xlabel('周期')
+        plt.ylabel('主路径选择概率')
+        plt.title('路由概率变化')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xticks(cycles)
+
+        # 设置y轴范围
+        plt.ylim(0, 1)
+
+        # 保存图表
+        plt.savefig(f"{plots_dir}/probability_{timestamp}.png", dpi=self.config['VISUALIZATION']['PLOT_DPI'])
+        plt.close()
+
+    def simulate_realistic_measurements(self):
+        """
+        模拟真实测量数据
+
+        用于演示和测试，生成合理的性能数据
+        """
+        # 模拟链路ID
+        link_id = "S(2,3)-east"
+
+        # 每个周期的负载基线
+        base_loads = {
+            CongestionPhase.PRE_CONGESTION: 0.35,
+            CongestionPhase.DURING_CONGESTION: 0.85,
+            CongestionPhase.POST_CONTROL: [0.65, 0.55, 0.45, 0.35]  # 每周期递减
+        }
+
+        # 每个周期的丢包率基线
+        base_loss_rates = [0.15, 0.08, 0.05, 0.02]  # 每周期递减
+
+        # 每个周期的时延基线(毫秒)
+        base_delays = [60, 55, 50, 45]  # 每周期递减
+
+        # 填充模拟数据
+        for cycle in range(4):
+            # 队列负载
+            for phase in [CongestionPhase.PRE_CONGESTION, CongestionPhase.DURING_CONGESTION]:
+                base = base_loads[phase]
+                for _ in range(20):  # 每阶段20个样本
+                    load = base + np.random.uniform(-0.05, 0.05)
+                    if link_id not in self.metrics_by_cycle[cycle]['queue_loads']:
+                        self.metrics_by_cycle[cycle]['queue_loads'][link_id] = {
+                            CongestionPhase.PRE_CONGESTION: [],
+                            CongestionPhase.DURING_CONGESTION: [],
+                            CongestionPhase.POST_CONTROL: []
+                        }
+                    self.metrics_by_cycle[cycle]['queue_loads'][link_id][phase].append(load)
+
+            # 控制后负载(每周期不同)
+            post_base = base_loads[CongestionPhase.POST_CONTROL][cycle]
+            for _ in range(20):
+                load = post_base + np.random.uniform(-0.05, 0.05)
+                if link_id not in self.metrics_by_cycle[cycle]['queue_loads']:
+                    self.metrics_by_cycle[cycle]['queue_loads'][link_id] = {
+                        CongestionPhase.PRE_CONGESTION: [],
+                        CongestionPhase.DURING_CONGESTION: [],
+                        CongestionPhase.POST_CONTROL: []
+                    }
+                self.metrics_by_cycle[cycle]['queue_loads'][link_id][CongestionPhase.POST_CONTROL].append(load)
+
+            # 丢包统计
+            loss_rate = base_loss_rates[cycle]
+            total_packets = 1000
+            loss_packets = int(total_packets * loss_rate)
+
+            self.metrics_by_cycle[cycle]['packet_stats'][link_id] = {
+                'total': total_packets,
+                'success': total_packets - loss_packets,
+                'loss': loss_packets,
+                'delays': []
+            }
+
+            # 时延
+            delay_ms = base_delays[cycle]
+            for _ in range(100):  # 100个样本
+                delay = (delay_ms + np.random.uniform(-5, 5)) / 1000  # 转换为秒
+                self.metrics_by_cycle[cycle]['delays'].append(delay)
+                self.metrics_by_cycle[cycle]['packet_stats'][link_id]['delays'].append(delay)
+
+            # 路由概率
+            if cycle == 0:
+                base_prob = 0.5
+            else:
+                base_prob = 0.5 + cycle * 0.1  # 每周期递增
+
+            for _ in range(50):  # 50个样本
+                prob = base_prob + np.random.uniform(-0.05, 0.05)
+                prob = np.clip(prob, 0, 1)  # 确保在[0,1]范围内
+                self.metrics_by_cycle[cycle]['probabilities'].append(prob)
+
+        # 控制开销
+        self.data_message_size = 1024 * 1024 * 100  # 100MB数据
+        self.control_message_size = 1024 * 1024 * 5  # 5MB控制数据
