@@ -5,20 +5,14 @@ from datetime import datetime
 import logging
 import os
 import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Set
 
-# 导入核心组件
-from core.dra_router import DRARouter
-from core.probabilistic_controller import ProbabilisticController
+from core.ospf_router import OSPFRouter
+from core.lsa_manager import LSAManager, LinkStateAdvertisement
 from core.congestion_detector import CongestionDetector
-from core.packet import DataPacket, TrafficGenerator, TrafficMetricPacket, QueueStateUpdatePacket
-
-# 导入模型
+from core.packet import DataPacket, LSAPacket, TrafficGenerator
 from models.satellite import Satellite
-from models.link import Link
-
-# 导入工具
-from utils.metrics import PerformanceMetrics, CongestionPhase
+from utils.metrics import PerformanceMetrics
 from utils.config import SYSTEM_CONFIG
 
 # 配置日志
@@ -27,392 +21,467 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
-class ProbabilisticCongestionControl:
-    """
-    分布式概率拥塞控制系统主类
-
-    实现DRA路由算法和分布式概率拥塞控制
-    """
+class OSPFCongestionControl:
+    """基于OSPF的拥塞控制系统"""
 
     def __init__(self):
         """初始化系统"""
-        # 加载配置
         self.config = SYSTEM_CONFIG
         self.simulation_start_time = None
 
-        # 设置随机数种子，确保结果可重现
-        np.random.seed(self.config['SIMULATION_SEED'])
-
         # 初始化组件
-        self.dra_router = DRARouter(
+        self.ospf_router = OSPFRouter(
             self.config['NUM_ORBIT_PLANES'],
             self.config['SATS_PER_PLANE'],
-            self.config['POLAR_THRESHOLD']
+            self.config['LINK_COST_ALPHA']
         )
-
-        self.prob_controller = ProbabilisticController(
-            buffer_weight=self.config['BUFFER_WEIGHT'],
-            neighbor_weight=self.config['NEIGHBOR_WEIGHT'],
-            pref_probability=self.config['PREF_PROBABILITY'],
-            threshold=self.config['THRESHOLD'],
-            queue_size=self.config['QUEUE_SIZE']
+        self.lsa_manager = LSAManager(
+            self.config['CACHE_UPDATE_INTERVAL']
         )
-
-        self.congestion_detector = CongestionDetector(
-            warning_threshold=self.config['WARNING_THRESHOLD'],
-            congestion_threshold=self.config['CONGESTION_THRESHOLD'],
-            release_duration=self.config['RELEASE_DURATION']
+        self.detector = CongestionDetector(
+            self.config['WARNING_THRESHOLD'],
+            self.config['CONGESTION_THRESHOLD'],
+            self.config['CACHE_UPDATE_INTERVAL']
         )
+        self.traffic_generator = TrafficGenerator(
+            self.config['LINK_CAPACITY']
+        )
+        self.metrics = PerformanceMetrics()
 
-        # 初始化性能指标收集器
-        self.metrics = PerformanceMetrics(self.config)
-
-        # 初始化卫星星座和链路
+        # 初始化星座
         self.satellites = self._initialize_constellation()
         self._setup_links()
+        self._identify_ground_stations()
 
-        # 初始化流量生成器
-        self.traffic_generator = TrafficGenerator(self.config['LINK_CAPACITY'])
-
-        logger.info("分布式概率拥塞控制系统初始化完成")
+        # 设置OSPF路由器的卫星引用
+        self.ospf_router._set_satellites(self.satellites)
 
     def _initialize_constellation(self) -> Dict[Tuple[int, int], Satellite]:
         """
         初始化卫星星座
 
         Returns:
-            dict: 网格坐标到卫星对象的映射
+            Dict[Tuple[int, int], Satellite]: 卫星字典 {卫星ID: 卫星对象}
         """
-        logger.info(f"初始化卫星星座: {self.config['NUM_ORBIT_PLANES']}个轨道面, "
-                    f"每个轨道面{self.config['SATS_PER_PLANE']}颗卫星")
-
         satellites = {}
         for i in range(self.config['NUM_ORBIT_PLANES']):
             for j in range(self.config['SATS_PER_PLANE']):
                 grid_pos = (i, j)
                 satellites[grid_pos] = Satellite(grid_pos=grid_pos)
-
-                # 标记需要监控的卫星
-                if self.config['CONGESTION_SCENARIO']['TYPE'] == 'single':
-                    conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
-                    if (i == conf['source_plane'] and j == conf['source_index']):
-                        satellites[grid_pos].is_monitored = True
-
         return satellites
 
     def _setup_links(self):
-        """建立卫星间的链路"""
-        logger.info("建立星间链路")
-
+        """设置卫星间链路"""
         for i in range(self.config['NUM_ORBIT_PLANES']):
             for j in range(self.config['SATS_PER_PLANE']):
                 current = self.satellites[(i, j)]
 
-                # 建立南北向链路(同一轨道内)
+                # 建立南北向链路
                 next_j = (j + 1) % self.config['SATS_PER_PLANE']
                 prev_j = (j - 1) % self.config['SATS_PER_PLANE']
+                current.add_link('south', self.satellites[(i, next_j)])
+                current.add_link('north', self.satellites[(i, prev_j)])
 
-                current.add_link('south', self.satellites[(i, next_j)],
-                                 self.config['LINK_CAPACITY'],
-                                 self.config['QUEUE_SIZE'])
-
-                current.add_link('north', self.satellites[(i, prev_j)],
-                                 self.config['LINK_CAPACITY'],
-                                 self.config['QUEUE_SIZE'])
-
-                # 建立东西向链路(跨轨道)
+                # 建立东西向链路
                 if i < self.config['NUM_ORBIT_PLANES'] - 1:
-                    current.add_link('east', self.satellites[(i + 1, j)],
-                                     self.config['LINK_CAPACITY'],
-                                     self.config['QUEUE_SIZE'])
-
+                    current.add_link('east', self.satellites[(i + 1, j)])
                 if i > 0:
-                    current.add_link('west', self.satellites[(i - 1, j)],
-                                     self.config['LINK_CAPACITY'],
-                                     self.config['QUEUE_SIZE'])
+                    current.add_link('west', self.satellites[(i - 1, j)])
 
-        logger.info("星间链路建立完成")
+    def _identify_ground_stations(self):
+        """标识地面站连接点"""
+        for station in self.config['CONGESTION_SCENARIO']['GROUND_STATIONS']:
+            sat_id = (station['plane'], station['index'])
+            if sat_id in self.satellites:
+                self.satellites[sat_id].is_ground_station = True
+
+    def _get_hotspot_satellites(self) -> List[Tuple[int, int]]:
+        """
+        获取热点区域卫星ID列表
+
+        Returns:
+            List[Tuple[int, int]]: 热点区域卫星ID列表
+        """
+        hotspots = []
+        for hotspot in self.config['CONGESTION_SCENARIO']['HOTSPOTS']:
+            sat_id = (hotspot['plane'], hotspot['index'])
+            if sat_id in self.satellites:
+                hotspots.append(sat_id)
+        return hotspots
+
+    def _get_ground_station_satellites(self) -> List[Tuple[int, int]]:
+        """
+        获取地面站连接卫星ID列表
+
+        Returns:
+            List[Tuple[int, int]]: 地面站连接卫星ID列表
+        """
+        ground_stations = []
+        for satellite in self.satellites.values():
+            if satellite.is_ground_station:
+                ground_stations.append(satellite.grid_pos)
+        return ground_stations
 
     def handle_packet(self, packet: DataPacket, current_sat: Satellite) -> bool:
         """
-        处理数据包路由，实现分布式概率拥塞控制
+        处理数据包
 
         Args:
             packet: 数据包
-            current_sat: 当前卫星节点
+            current_sat: 当前卫星
 
         Returns:
-            bool: 处理是否成功
+            bool: 如果处理成功返回True，否则返回False
         """
         try:
-            # 已到达目标节点
+            # 如果到达目的地，成功处理
             if current_sat.grid_pos == packet.destination:
                 return True
 
-            # 使用DRA计算主要和次要方向
-            primary_dir, secondary_dir = self.dra_router.calculate_directions(
-                current_sat.grid_pos, packet.destination, current_sat)
+            # 使用OSPF路由器获取下一跳方向
+            next_direction = self.ospf_router.get_next_hop(current_sat, packet.destination)
 
-            if not primary_dir:
-                logger.warning(f"无法计算从{current_sat.grid_pos}到{packet.destination}的路由")
+            if not next_direction or next_direction not in current_sat.links:
+                # 找不到下一跳或链路不存在
                 return False
 
-            # 获取队列长度信息
-            queue_lengths = current_sat.get_queue_lengths()
+            # 获取链路并入队
+            link = current_sat.links[next_direction]
+            success = link.enqueue(packet)
 
-            # 获取流量度量信息
-            traffic_metrics = current_sat.get_all_traffic_metrics()
-
-            # 使用概率控制器做出路由决策
-            selected_dir = self.prob_controller.make_routing_decision(
-                primary_dir, secondary_dir, queue_lengths, traffic_metrics)
-
-            # 记录路由概率(用于性能分析)
-            if primary_dir and secondary_dir:
-                primary_congestion = self.prob_controller.calculate_congestion_level(
-                    queue_lengths.get(primary_dir, 0),
-                    traffic_metrics.get(primary_dir, 0)
-                )
-
-                secondary_congestion = self.prob_controller.calculate_congestion_level(
-                    queue_lengths.get(secondary_dir, 0),
-                    traffic_metrics.get(secondary_dir, 0)
-                )
-
-                prob = self.prob_controller.calculate_routing_probability(
-                    primary_congestion, secondary_congestion)
-
-                self.metrics.record_routing_probability(prob)
-
-            # 获取选择的链路
-            selected_link = current_sat.links.get(selected_dir)
-            if not selected_link:
-                logger.warning(f"链路不存在: {current_sat.grid_pos}-{selected_dir}")
-                return False
-
-            # 检查链路拥塞状态
-            link_state = self.congestion_detector.check_link_state(selected_link)
-
-            # 构造链路ID(用于指标收集)
-            link_id = f"S{current_sat.grid_pos[0]}-{current_sat.grid_pos[1]}-{selected_dir}"
-
-            # 更新数据包中的流量度量
-            outgoing_metric = current_sat.calculate_outgoing_traffic_metric(selected_dir)
-            self.prob_controller.update_packet_metric(packet, outgoing_metric)
-
-            # 数据包入队
-            success = selected_link.enqueue(packet)
-
-            # 记录性能指标
             if success:
-                delay = time.time() - packet.creation_time
-                self.metrics.record_packet_stats(link_id, True, delay)
-                self.metrics.record_data_message(packet.size // 8)  # 比特转字节
+                # 记录指标
+                link_id = f"S{current_sat.grid_pos[0]}-{current_sat.grid_pos[1]}-{next_direction}"
+                self.metrics.record_packet_metrics(packet, link_id, True)
             else:
-                self.metrics.record_packet_stats(link_id, False)
-
-            # 更新流量度量
-            if selected_link.should_update_metrics():
-                # 生成并发送流量度量包
-                target_sat = self.satellites.get(selected_link.target_id)
-                if target_sat:
-                    reverse_dir = self._get_reverse_direction(selected_dir)
-                    target_sat.update_traffic_metric(reverse_dir, outgoing_metric)
-
-                    # 记录控制消息开销
-                    self.metrics.record_control_message(64)  # 假设64字节的控制消息
+                # 数据包丢失
+                link_id = f"S{current_sat.grid_pos[0]}-{current_sat.grid_pos[1]}-{next_direction}"
+                self.metrics.record_packet_metrics(packet, link_id, False)
 
             return success
-
         except Exception as e:
-            logger.error(f"处理数据包时出错: {str(e)}", exc_info=True)
+            logger.error(f"Error handling packet: {str(e)}")
             return False
 
-    def _get_reverse_direction(self, direction: str) -> str:
-        """
-        获取相反方向
+    def update_link_costs(self):
+        """更新所有链路成本"""
+        for sat_id, satellite in self.satellites.items():
+            for direction, link in satellite.links.items():
+                # 检查链路状态
+                link_state = self.detector.check_link_state(link)
 
-        Args:
-            direction: 方向
+                # 计算OSPF成本
+                cost = link.calculate_ospf_cost()
 
-        Returns:
-            str: 相反方向
-        """
-        opposite = {
-            'north': 'south',
-            'south': 'north',
-            'east': 'west',
-            'west': 'east'
-        }
-        return opposite.get(direction, direction)
+                # 生成链路ID
+                link_id = f"S{sat_id[0]}-{sat_id[1]}-{direction}"
 
-    def _simulate_packet_transmission(self):
-        """
-        模拟数据包传输
+                # 判断是否需要更新LSA
+                if self.lsa_manager.should_update(link_id, cost) or self.detector.should_update_lsa(link):
+                    # 创建新的LSA
+                    lsa = self.lsa_manager.create_lsa(link_id, cost, sat_id)
 
-        生成流量并传输数据包
-        """
-        current_time = time.time() - self.simulation_start_time
-        current_cycle = self.metrics.get_current_cycle()
+                    # 更新OSPF路由器的链路状态数据库
+                    self.ospf_router.update_link_state(link_id, cost)
 
-        # 更新当前拥塞阶段
-        self.metrics.update_phase()
-        current_phase = self.metrics.current_phase
+    def update_routing_tables(self):
+        """更新所有卫星的路由表"""
+        self.ospf_router.update_all_routing_tables(self.satellites)
 
-        # 针对单链路拥塞场景生成流量
-        if self.config['CONGESTION_SCENARIO']['TYPE'] == 'single':
-            conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
-            source_sat = self.satellites.get((conf['source_plane'], conf['source_index']))
+    def _simulate_normal_traffic(self):
+        """模拟正常流量"""
+        for sat_id, satellite in self.satellites.items():
+            # 生成数据包
+            packets = satellite.generate_traffic(
+                self.traffic_generator,
+                'normal',
+                self.config['NUM_ORBIT_PLANES'],
+                self.config['SATS_PER_PLANE']
+            )
 
-            if source_sat and source_sat.is_monitored:
-                # 针对拥塞链路生成特定状态的流量
-                link = source_sat.links.get(conf['direction'])
+            # 处理数据包
+            for packet in packets:
+                self.handle_packet(packet, satellite)
 
-                if link:
-                    # 构造链路ID
-                    link_id = f"S({conf['source_plane']},{conf['source_index']})-{conf['direction']}"
+    def _simulate_hotspot_traffic(self):
+        """模拟热点区域流量"""
+        hotspots = self._get_hotspot_satellites()
+        ground_stations = self._get_ground_station_satellites()
 
-                    # 生成适当状态的流量
-                    state = 'normal'
-                    if current_phase == CongestionPhase.DURING_CONGESTION:
-                        state = 'congestion'
-                    elif current_phase == CongestionPhase.POST_CONTROL:
-                        state = 'warning'
+        # 生成热点流量
+        packets = self.traffic_generator.generate_hotspot_traffic(
+            hotspots,
+            ground_stations,
+            'congestion'
+        )
 
-                    # 生成数据包
-                    packets = self.traffic_generator.generate_packets(
-                        source_sat.grid_pos,
-                        state,
-                        self.config['NUM_ORBIT_PLANES'],
-                        self.config['SATS_PER_PLANE']
-                    )
+        # 处理数据包
+        for packet in packets:
+            source_id = packet.source
+            if source_id in self.satellites:
+                self.handle_packet(packet, self.satellites[source_id])
 
-                    # 将数据包路由到网络中
-                    for packet in packets:
-                        self.handle_packet(packet, source_sat)
+    def _process_link_queues(self):
+        """处理所有链路队列"""
+        for satellite in self.satellites.values():
+            for link in satellite.links.values():
+                # 出队并处理
+                while True:
+                    packet = link.dequeue()
+                    if not packet:
+                        break
 
-                    # 记录队列负载
-                    self.metrics.record_queue_load(
-                        link_id,
-                        len(link.queue),
-                        link.queue_size
-                    )
-
-        # 为所有其他卫星生成背景流量
-        for pos, sat in self.satellites.items():
-            # 跳过拥塞源卫星(已经处理过)
-            if self.config['CONGESTION_SCENARIO']['TYPE'] == 'single':
-                conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
-                if pos == (conf['source_plane'], conf['source_index']):
-                    continue
-
-            # 每10个卫星只为1个生成流量(降低负载)
-            if np.random.random() < 0.1:
-                # 生成背景流量(正常状态)
-                packets = self.traffic_generator.generate_packets(
-                    sat.grid_pos,
-                    'normal',
-                    self.config['NUM_ORBIT_PLANES'],
-                    self.config['SATS_PER_PLANE']
-                )
-
-                # 将数据包路由到网络中
-                for packet in packets:
-                    self.handle_packet(packet, sat)
-
-        # 出队并转发数据包
-        self._process_queues()
-
-    def _process_queues(self):
-        """处理所有队列，出队并转发数据包"""
-        for sat in self.satellites.values():
-            for direction, link in sat.links.items():
-                # 尝试出队一个数据包
-                packet = link.dequeue()
-
-                if packet:
                     # 获取目标卫星
-                    target_sat = self.satellites.get(link.target_id)
-
-                    if target_sat:
-                        # 提取数据包中的流量度量信息
-                        reverse_dir = self._get_reverse_direction(direction)
-                        target_sat.update_traffic_metric(reverse_dir, packet.traffic_metric)
-
-                        # 继续处理数据包
+                    target_id = link.target_id
+                    if target_id in self.satellites:
+                        target_sat = self.satellites[target_id]
                         self.handle_packet(packet, target_sat)
-
-    def run_simulation(self):
-        """
-        运行仿真
-
-        根据配置运行指定时长的仿真
-        """
-        logger.info("开始仿真...")
-        self.simulation_start_time = time.time()
-        simulation_duration = self.config['CONGESTION_SCENARIO']['TOTAL_DURATION']
-
-        try:
-            last_progress_report = 0
-
-            while (time.time() - self.simulation_start_time < simulation_duration):
-                current_time = time.time() - self.simulation_start_time
-
-                # 每30秒报告进度
-                if int(current_time) // 30 > last_progress_report:
-                    progress = (current_time / simulation_duration) * 100
-                    logger.info(f"仿真进度: {progress:.1f}%")
-                    last_progress_report = int(current_time) // 30
-
-                # 模拟数据包传输
-                self._simulate_packet_transmission()
-
-                # 按配置的步长暂停
-                time.sleep(self.config['SIMULATION_STEP'])
-
-            logger.info("仿真完成")
-
-        except KeyboardInterrupt:
-            logger.info("用户中断仿真")
-        except Exception as e:
-            logger.error(f"仿真过程中出错: {str(e)}", exc_info=True)
-        finally:
-            # 生成性能报告
-            report_path = self.metrics.generate_performance_report()
-            logger.info(f"性能报告已生成: {report_path}")
 
     def _collect_metrics(self):
         """收集性能指标"""
-        # 更新当前拥塞阶段
-        self.metrics.update_phase()
+        current_time = time.time() - self.simulation_start_time
+        cycle_time = current_time % self.config['CONGESTION_SCENARIO']['CONGESTION_INTERVAL']
 
-        # 收集监控链路的指标
-        if self.config['CONGESTION_SCENARIO']['TYPE'] == 'single':
-            conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
-            sat = self.satellites.get((conf['source_plane'], conf['source_index']))
+        # 确定当前阶段
+        if cycle_time < self.config['CONGESTION_SCENARIO']['CONGESTION_DURATION']:
+            phase = 'during_congestion'
+        elif cycle_time < self.config['CONGESTION_SCENARIO']['CONGESTION_DURATION'] + 15:
+            phase = 'post_control'
+        else:
+            phase = 'pre_congestion'
 
-            if sat and sat.is_monitored:
-                link = sat.links.get(conf['direction'])
+        # 更新监控链路的指标
+        for link_conf in (
+                [self.config['CONGESTION_SCENARIO']['SINGLE_LINK']]
+                if self.config['CONGESTION_SCENARIO']['TYPE'] == 'single'
+                else self.config['CONGESTION_SCENARIO']['MULTIPLE_LINKS']
+        ):
+            sat = self.satellites.get((link_conf['source_plane'], link_conf['source_index']))
+            if sat and link_conf['direction'] in sat.links:
+                link = sat.links[link_conf['direction']]
+                link_id = f"S{link_conf['source_plane']}-{link_conf['source_index']}-{link_conf['direction']}"
 
-                if link:
-                    link_id = f"S({conf['source_plane']},{conf['source_index']})-{conf['direction']}"
+                # 记录队列负载率
+                self.metrics.record_queue_load(
+                    link_id,
+                    phase,
+                    len(link.queue),
+                    link.queue_size
+                )
 
-                    # 记录队列负载
-                    self.metrics.record_queue_load(
-                        link_id,
-                        len(link.queue),
-                        link.queue_size
-                    )
+    def _generate_performance_report(self):
+        """
+        生成性能报告
+
+        Returns:
+            str: 报告文件路径
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join("reports", f"performance_report_{timestamp}.txt")
+        os.makedirs("reports", exist_ok=True)
+
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=== 基于OSPF的LEO卫星星座拥塞控制性能评估报告 ===\n\n")
+
+            # 1. 拥塞链路性能分析
+            f.write("1. 拥塞链路性能分析:\n")
+            link_conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
+            link_id = f"S{link_conf['source_plane']}-{link_conf['source_index']}-{link_conf['direction']}"
+            f.write(f"\n链路 {link_id} 的性能指标:\n")
+
+            # 从指标中获取数据
+            for cycle in range(4):
+                cycle_start = cycle * 60
+                f.write(f"\n第{cycle + 1}次拥塞周期 (开始时间: {cycle_start}s):\n")
+
+                # 获取周期性能总结
+                summary = self.metrics.get_cycle_summary(cycle, link_id)
+
+                f.write(f"* pre_congestion阶段 队列负载率: {summary['pre_congestion']:.2f}%\n")
+                f.write(f"* during_congestion阶段 队列负载率: {summary['during_congestion']:.2f}%\n")
+                f.write(f"* post_control阶段 队列负载率: {summary['post_control']:.2f}%\n")
+                f.write(f"* 拥塞控制改善率: {summary['improvement']:.2f}%\n")
+
+                # 获取丢包率
+                loss_rates = self.metrics.calculate_link_loss_rate(link_id)
+                f.write(f"* 丢包率: {loss_rates[cycle]:.2f}%\n")
+
+            # 2. OSPF路由性能分析
+            f.write("\n2. OSPF路由性能分析:\n")
+            for cycle in range(4):
+                f.write(f"第{cycle + 1}个周期:\n")
+
+                # 获取每个周期的路由更新统计
+                route_updates = self.metrics.get_routing_updates_stats(cycle)
+                f.write(f"* LSA更新次数: {route_updates['lsa_updates']}\n")
+                f.write(f"* 路由表更新次数: {route_updates['route_updates']}\n")
+                f.write(f"* 平均链路成本变化: {route_updates['avg_cost_change']:.2f}\n")
+                f.write(f"* 响应时间: {route_updates['response_time']:.2f}s\n")
+
+            # 3. 总体改善效果
+            f.write("\n3. 总体改善效果:\n")
+            avg_improvement, std_improvement = self.metrics.calculate_overall_improvement()
+            overhead = self.metrics.calculate_control_overhead()
+
+            f.write(f"* 平均改善率: {avg_improvement:.2f}%\n")
+            f.write(f"* 改善率标准差: {std_improvement:.2f}%\n")
+            f.write(f"* 控制开销比例: {overhead:.2f}%\n")
+
+        # 生成可视化图表
+        self.generate_performance_plots(timestamp)
+
+        logger.info(f"Performance report generated: {report_path}")
+        return report_path
+
+    def generate_performance_plots(self, timestamp: str):
+        """
+        生成性能分析图表
+
+        Args:
+            timestamp: 时间戳
+        """
+        plots_dir = "plots"
+        os.makedirs(plots_dir, exist_ok=True)
+
+        # 获取链路信息
+        link_conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
+        link_id = f"S{link_conf['source_plane']}-{link_conf['source_index']}-{link_conf['direction']}"
+
+        # 1. 队列负载率对比图
+        plt.figure(figsize=(12, 6))
+
+        # 从指标中获取数据
+        pre_loads = []
+        during_loads = []
+        post_loads = []
+        loss_rates = []
+
+        for cycle in range(4):
+            summary = self.metrics.get_cycle_summary(cycle, link_id)
+            pre_loads.append(summary['pre_congestion'])
+            during_loads.append(summary['during_congestion'])
+            post_loads.append(summary['post_control'])
+
+            rates = self.metrics.calculate_link_loss_rate(link_id)
+            loss_rates.append(rates[cycle])
+
+        # 创建柱状图和折线图组合
+        x = np.arange(4)
+        width = 0.25
+
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+
+        ax1.bar(x - width, pre_loads, width, label='拥塞前', color='#3274A1')
+        ax1.bar(x, during_loads, width, label='拥塞期间', color='#E1812C')
+        ax1.bar(x + width, post_loads, width, label='控制后', color='#3A923A')
+
+        ax1.set_ylabel('队列负载率 (%)')
+        ax1.set_xlabel('周期')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels([f'周期 {i + 1}' for i in x])
+        ax1.set_ylim(0, 100)
+
+        # 创建次坐标轴用于丢包率折线图
+        ax2 = ax1.twinx()
+        ax2.plot(x, loss_rates, 'k--o', linewidth=1.5, label='丢包率')
+        ax2.set_ylabel('丢包率 (%)')
+        ax2.set_ylim(0, 25)
+
+        # 合并图例
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+        ax1.grid(True)
+        ax1.set_title('基于OSPF的拥塞控制效果 - 队列负载率与丢包率')
+
+        plt.tight_layout()
+        plt.savefig(f"{plots_dir}/queue_load_rate_{timestamp}.png")
+        plt.close()
+
+        # 2. 链路成本变化图
+        plt.figure(figsize=(10, 6))
+
+        cost_data = self.metrics.get_link_cost_data(link_id)
+        cycles = range(4)
+
+        for cycle in cycles:
+            times = cost_data[cycle]['times']
+            costs = cost_data[cycle]['costs']
+            plt.plot(times, costs, 'o-', label=f'周期 {cycle + 1}')
+
+        plt.xlabel('周期内时间 (s)')
+        plt.ylabel('OSPF链路成本')
+        plt.title('OSPF链路成本随时间变化')
+        plt.legend()
+        plt.grid(True)
+
+        plt.savefig(f"{plots_dir}/link_cost_{timestamp}.png")
+        plt.close()
+
+    def run_simulation(self):
+        """运行仿真"""
+        logger.info("Starting simulation...")
+        self.simulation_start_time = time.time()
+        simulation_duration = self.config['CONGESTION_SCENARIO']['TOTAL_DURATION']
+
+        # 初始化路由表
+        self.update_routing_tables()
+
+        try:
+            while (time.time() - self.simulation_start_time < simulation_duration):
+                current_time = time.time() - self.simulation_start_time
+
+                # 每30秒打印进度
+                if int(current_time) % 30 == 0:
+                    progress = (current_time / simulation_duration) * 100
+                    logger.info(f"Simulation progress: {progress:.1f}%")
+
+                # 确定当前时间在周期中的位置
+                cycle_time = current_time % self.config['CONGESTION_SCENARIO']['CONGESTION_INTERVAL']
+
+                # 检查是否处于拥塞高峰期
+                is_congestion_period = (
+                        cycle_time < self.config['CONGESTION_SCENARIO']['CONGESTION_DURATION']
+                )
+
+                # 模拟正常流量
+                self._simulate_normal_traffic()
+
+                # 如果处于拥塞高峰期，增加热点流量
+                if is_congestion_period:
+                    self._simulate_hotspot_traffic()
+
+                # 处理链路队列
+                self._process_link_queues()
+
+                # 更新链路成本
+                self.update_link_costs()
+
+                # 定期更新路由表（每5秒更新一次）
+                if int(current_time) % 5 == 0:
+                    self.update_routing_tables()
+
+                # 收集性能指标
+                self._collect_metrics()
+
+                # 等待下一个仿真步
+                time.sleep(self.config['SIMULATION_STEP'])
+
+        except KeyboardInterrupt:
+            logger.info("Simulation interrupted by user")
+        finally:
+            self._generate_performance_report()
 
 
 def main():
     """主函数"""
     try:
-        # 创建并运行分布式概率拥塞控制系统
-        dpc_system = ProbabilisticCongestionControl()
-        dpc_system.run_simulation()
+        ospf_system = OSPFCongestionControl()
+        ospf_system.run_simulation()
     except Exception as e:
-        logger.error(f"程序运行错误: {str(e)}", exc_info=True)
+        logger.error(f"Error in main: {str(e)}")
+        raise e
 
 
 if __name__ == "__main__":

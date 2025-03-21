@@ -1,43 +1,42 @@
 # core/packet.py
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, List, Optional
 import time
 import numpy as np
 
 
 @dataclass
 class DataPacket:
-    """
-    数据包类
+    """数据包类"""
 
-    在分布式概率拥塞控制算法中，数据包携带流量度量信息
-    """
     id: int  # 唯一标识符
     source: Tuple[int, int]  # 源节点网格坐标
     destination: Tuple[int, int]  # 目标节点网格坐标
     size: int = 1024 * 8  # 数据包大小(bits)
     creation_time: float = None  # 创建时间
-    traffic_metric: float = 0.0  # 流量度量信息
 
     def __post_init__(self):
         if self.creation_time is None:
             self.creation_time = time.time()
 
-    def get_age(self) -> float:
-        """获取数据包年龄（秒）"""
-        return time.time() - self.creation_time
 
-    def update_traffic_metric(self, metric: float):
-        """更新流量度量信息"""
-        self.traffic_metric = metric
+@dataclass
+class LSAPacket:
+    """链路状态通告包"""
+
+    link_id: str  # 链路标识符
+    cost: float  # 链路成本
+    source_id: Tuple[int, int]  # 源卫星ID
+    sequence_number: int  # 序列号
+    timestamp: float = None  # 时间戳
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = time.time()
 
 
 class TrafficGenerator:
-    """
-    流量生成器
-
-    生成模拟网络负载的数据包
-    """
+    """流量生成器"""
 
     def __init__(self, link_capacity: float = 25.0):
         """
@@ -52,9 +51,9 @@ class TrafficGenerator:
 
         # 状态对应的流量比例
         self.state_ratios = {
-            'normal': 0.45,  # 正常状态：45%容量
-            'warning': 0.65,  # 预警状态：65%容量
-            'congestion': 0.85,  # 拥塞状态：85%容量
+            'normal': 0.3,  # 正常状态：30%容量
+            'warning': 0.5,  # 预警状态：50%容量
+            'congestion': 0.7,  # 拥塞状态：70%容量
         }
 
     def calculate_packets_per_step(self, state: str) -> int:
@@ -62,7 +61,7 @@ class TrafficGenerator:
         计算每个时间步应生成的数据包数量
 
         Args:
-            state: 链路状态('normal', 'warning', 'congestion')
+            state: 当前链路状态
 
         Returns:
             int: 数据包数量
@@ -73,42 +72,41 @@ class TrafficGenerator:
         # 计算理论包数
         packets_per_step = (target_rate * self.time_step) / self.packet_size
 
-        # 添加随机扰动(±5%)
-        actual_packets = int(packets_per_step * (1 + np.random.uniform(-0.05, 0.05)))
+        # 添加随机扰动
+        actual_packets = int(packets_per_step * (1 + np.random.uniform(-0.1, 0.1)))
 
-        # 确保至少有一些包，但不超过合理上限
-        return max(1, min(actual_packets, 100))
+        # 保证至少生成一些包，但不要太多
+        return max(1, min(actual_packets, 50))
 
     def generate_packets(self, source: Tuple[int, int], state: str,
-                         num_orbit_planes: int, sats_per_plane: int) -> List[DataPacket]:
+                         num_planes: int, sats_per_plane: int) -> List[DataPacket]:
         """
         生成一组数据包
 
         Args:
             source: 源节点坐标
             state: 当前状态
-            num_orbit_planes: 轨道面数量
+            num_planes: 轨道面数量
             sats_per_plane: 每个轨道面的卫星数量
 
         Returns:
-            list: 生成的数据包列表
+            List[DataPacket]: 生成的数据包列表
         """
         packets = []
         num_packets = self.calculate_packets_per_step(state)
 
-        for i in range(num_packets):
+        for _ in range(num_packets):
             # 随机选择目标卫星
-            dest_i = np.random.randint(0, num_orbit_planes)
-            dest_j = np.random.randint(0, sats_per_plane)
+            dest_i = np.random.randint(0, num_planes)  # 轨道面
+            dest_j = np.random.randint(0, sats_per_plane)  # 轨道内编号
             destination = (dest_i, dest_j)
 
             # 确保目标不是源节点
             if destination == source:
                 continue
 
-            # 创建数据包
             packet = DataPacket(
-                id=int(time.time() * 1000) + i,  # 毫秒时间戳加索引作为ID
+                id=int(time.time() * 1000000),  # 微秒级时间戳作为ID
                 source=source,
                 destination=destination
             )
@@ -116,43 +114,44 @@ class TrafficGenerator:
 
         return packets
 
+    def generate_hotspot_traffic(self, hotspot_sources: List[Tuple[int, int]],
+                                 ground_stations: List[Tuple[int, int]],
+                                 state: str) -> List[DataPacket]:
+        """
+        生成热点区域流量
 
-@dataclass
-class TrafficMetricPacket:
-    """
-    流量度量包
+        Args:
+            hotspot_sources: 热点区域的卫星坐标列表
+            ground_stations: 地面站坐标列表
+            state: 当前状态
 
-    在分布式概率拥塞控制算法中，节点之间交换的流量度量信息
-    """
-    source_id: Tuple[int, int]  # 源节点ID
-    direction: str  # 方向（'north', 'south', 'east', 'west'）
-    queue_length: int  # 队列长度
-    traffic_metric: float  # 流量度量值
-    timestamp: float = None  # 时间戳
+        Returns:
+            List[DataPacket]: 生成的数据包列表
+        """
+        packets = []
 
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = time.time()
+        # 为每个热点源生成流量
+        for source in hotspot_sources:
+            # 大部分流量发往地面站
+            ground_station_ratio = 0.7
 
+            num_packets = self.calculate_packets_per_step(state) * 2  # 热点流量翻倍
 
-@dataclass
-class QueueStateUpdatePacket:
-    """
-    队列状态更新包
+            for _ in range(num_packets):
+                if np.random.random() < ground_station_ratio and ground_stations:
+                    # 发往地面站
+                    destination = ground_stations[np.random.randint(0, len(ground_stations))]
+                else:
+                    # 发往随机卫星
+                    destination = hotspot_sources[np.random.randint(0, len(hotspot_sources))]
+                    while destination == source:  # 确保不是自己
+                        destination = hotspot_sources[np.random.randint(0, len(hotspot_sources))]
 
-    用于节点间交换队列状态信息，支持分布式拥塞控制决策
-    """
-    source_id: Tuple[int, int]  # 源节点ID
-    direction: str  # 方向
-    queue_length: int  # 队列长度
-    max_queue: int  # 最大队列长度
-    timestamp: float = None  # 时间戳
+                packet = DataPacket(
+                    id=int(time.time() * 1000000),  # 微秒级时间戳作为ID
+                    source=source,
+                    destination=destination
+                )
+                packets.append(packet)
 
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = time.time()
-
-    @property
-    def queue_occupancy(self) -> float:
-        """计算队列占用率"""
-        return self.queue_length / self.max_queue if self.max_queue > 0 else 0
+        return packets
