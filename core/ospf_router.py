@@ -1,4 +1,3 @@
-# core/ospf_router.py
 from typing import Dict, Tuple, List, Set
 import heapq
 import logging
@@ -15,7 +14,6 @@ class OSPFRouter:
                  link_cost_alpha: float = 0.5):
         """
         初始化OSPF路由器
-
         Args:
             num_planes: 轨道面数量
             sats_per_plane: 每个轨道面的卫星数量

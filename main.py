@@ -347,7 +347,7 @@ class OSPFCongestionControl:
         link_conf = self.config['CONGESTION_SCENARIO']['SINGLE_LINK']
         link_id = f"S{link_conf['source_plane']}-{link_conf['source_index']}-{link_conf['direction']}"
 
-        # 1. 队列负载率对比图
+        # 1. 队列负载率和丢包率对比图
         plt.figure(figsize=(12, 6))
 
         # 从指标中获取数据
@@ -371,20 +371,20 @@ class OSPFCongestionControl:
 
         fig, ax1 = plt.subplots(figsize=(12, 6))
 
-        ax1.bar(x - width, pre_loads, width, label='拥塞前', color='#3274A1')
-        ax1.bar(x, during_loads, width, label='拥塞期间', color='#E1812C')
-        ax1.bar(x + width, post_loads, width, label='控制后', color='#3A923A')
+        ax1.bar(x - width, pre_loads, width, label='Pre-Congestion', color='#3274A1')
+        ax1.bar(x, during_loads, width, label='During-Congestion', color='#E1812C')
+        ax1.bar(x + width, post_loads, width, label='Post-Control', color='#3A923A')
 
-        ax1.set_ylabel('队列负载率 (%)')
-        ax1.set_xlabel('周期')
+        ax1.set_ylabel('Queue Load Rate (%)')
+        ax1.set_xlabel('Cycle')
         ax1.set_xticks(x)
-        ax1.set_xticklabels([f'周期 {i + 1}' for i in x])
+        ax1.set_xticklabels([f'Cycle {i + 1}' for i in x])
         ax1.set_ylim(0, 100)
 
         # 创建次坐标轴用于丢包率折线图
         ax2 = ax1.twinx()
-        ax2.plot(x, loss_rates, 'k--o', linewidth=1.5, label='丢包率')
-        ax2.set_ylabel('丢包率 (%)')
+        ax2.plot(x, loss_rates, 'k--o', linewidth=1.5, label='Loss Rate')
+        ax2.set_ylabel('Loss Rate (%)')
         ax2.set_ylim(0, 25)
 
         # 合并图例
@@ -393,30 +393,61 @@ class OSPFCongestionControl:
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
 
         ax1.grid(True)
-        ax1.set_title('基于OSPF的拥塞控制效果 - 队列负载率与丢包率')
+        ax1.set_title('Queue Load Rate by Phase & Loss Rate')
 
         plt.tight_layout()
-        plt.savefig(f"{plots_dir}/queue_load_rate_{timestamp}.png")
+        plt.savefig(f"{plots_dir}/ospf_queue_load_loss_rate_{timestamp}.png")
         plt.close()
 
-        # 2. 链路成本变化图
+        # 2. 端到端时延变化图
         plt.figure(figsize=(10, 6))
 
-        cost_data = self.metrics.get_link_cost_data(link_id)
-        cycles = range(4)
+        # 获取时延数据
+        delay_data = self.metrics.generate_delay_data()
 
-        for cycle in cycles:
-            times = cost_data[cycle]['times']
-            costs = cost_data[cycle]['costs']
-            plt.plot(times, costs, 'o-', label=f'周期 {cycle + 1}')
+        # 绘制每个周期的时延曲线
+        cycle_colors = ['blue', 'orange', 'green', 'red']
 
-        plt.xlabel('周期内时间 (s)')
-        plt.ylabel('OSPF链路成本')
-        plt.title('OSPF链路成本随时间变化')
-        plt.legend()
-        plt.grid(True)
+        for cycle in range(4):
+            times = delay_data[cycle]['times']
+            delays = delay_data[cycle]['delays']
+            plt.plot(times, delays, color=cycle_colors[cycle], linewidth=1.5,
+                     label=f'Cycle {cycle + 1}')
 
-        plt.savefig(f"{plots_dir}/link_cost_{timestamp}.png")
+        # 标记拥塞期间
+        plt.axvspan(30, 35, alpha=0.2, color='gray', label='Congestion Period')
+
+        plt.xlabel('Time within Cycle (s)')
+        plt.ylabel('End-to-End Delay (ms)')
+        plt.title('End-to-End Delay Comparison Across Cycles')
+        plt.legend(loc='upper right')
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.xlim(0, 60)
+        plt.ylim(30, 65)
+
+        plt.tight_layout()
+        plt.savefig(f"{plots_dir}/ospf_end_to_end_delay_{timestamp}.png")
+        plt.close()
+
+        # 3. 添加响应时间图表
+        plt.figure(figsize=(10, 5))
+
+        # 获取响应时间数据
+        response_times = []
+        for cycle in range(4):
+            response_time = self.metrics.get_response_time(cycle, link_id)
+            response_times.append(response_time)
+
+        # 绘制响应时间柱状图
+        plt.bar(range(4), response_times,width=0.45, color='purple')
+        plt.xlabel('Cycle')
+        plt.ylabel('Response Time (s)')
+        plt.title('OSPF Congestion Control Response Time')
+        plt.xticks(range(4), [f'Cycle {i + 1}' for i in range(4)])
+        plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
+        plt.savefig(f"{plots_dir}/ospf_response_time_{timestamp}.png")
         plt.close()
 
     def run_simulation(self):
